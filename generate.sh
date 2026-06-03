@@ -1,6 +1,7 @@
 #!/bin/bash
 # generate.sh — Générateur interactif autoinstall.yaml
 # Ubuntu 26.04 LTS — Supporte LVM/Direct, ext4/btrfs/xfs
+set -euo pipefail
 
 RED='\033[0;31m'
 GRN='\033[0;32m'
@@ -9,6 +10,16 @@ BLU='\033[1;34m'
 CYN='\033[0;36m'
 BLD='\033[1m'
 RST='\033[0m'
+
+# =============================================================
+# PRÉREQUIS
+# =============================================================
+for cmd in openssl lsblk; do
+    command -v "$cmd" &>/dev/null || {
+        echo -e "${RED}✗ Commande requise manquante : $cmd${RST}" >&2
+        exit 1
+    }
+done
 
 banner() {
     echo -e "${BLU}${BLD}"
@@ -42,6 +53,10 @@ ask_password() {
         echo -ne "${BLD}  ➜ $prompt${RST} : "
         read -rs pw1
         echo
+        if [[ -z "$pw1" ]]; then
+            echo -e "${RED}  ✗ Le mot de passe ne peut pas être vide.${RST}"
+            continue
+        fi
         echo -ne "${BLD}  ➜ Confirmer${RST} : "
         read -rs pw2
         echo
@@ -100,17 +115,41 @@ yes_no() {
 }
 
 validate_size() {
+    # Accepte ex: 512M, 1G, 30G  (pas -1, géré séparément)
     [[ "$1" =~ ^[0-9]+[MG]$ ]] && return 0
     echo -e "${RED}  ✗ Format invalide. Utiliser ex: 512M, 1G, 30G${RST}"
     return 1
 }
 
+validate_hostname() {
+    # RFC 1123 : alphanum + tirets, max 63 chars, pas de tiret en début/fin
+    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$ ]] && return 0
+    echo -e "${RED}  ✗ Hostname invalide (alphanum et tirets uniquement, max 63 chars).${RST}"
+    return 1
+}
+
+validate_username() {
+    # POSIX : commence par lettre ou _, alphanum _ - . uniquement
+    [[ "$1" =~ ^[a-z_][a-z0-9_\-]{0,31}$ ]] && return 0
+    echo -e "${RED}  ✗ Username invalide (minuscules, chiffres, _ ou -, max 32 chars).${RST}"
+    return 1
+}
+
+validate_disk() {
+    [[ -b "$1" ]] && return 0
+    echo -e "${RED}  ✗ Périphérique '$1' introuvable ou non-bloc. Vérifiez le nom.${RST}"
+    return 1
+}
+
+# Encode un hash SHA-512 de façon sûre pour YAML (pas de sed)
+hash_password() {
+    openssl passwd -6 "$1"
+}
+
 list_disks() {
     echo -e "${BLD}  Disques détectés :${RST}"
-    if command -v lsblk &>/dev/null; then
-        lsblk -dpno NAME,SIZE,MODEL 2>/dev/null | grep -v "loop" |
-            awk '{printf "    %s  %-8s  %s\n", $1, $2, $3}' || true
-    fi
+    lsblk -dpno NAME,SIZE,MODEL 2>/dev/null | grep -v "loop" |
+        awk '{printf "    %s  %-8s  %s\n", $1, $2, $3}' || echo "    (aucun disque détecté)"
 }
 
 banner
@@ -120,14 +159,18 @@ banner
 # =============================================================
 section "1. SYSTÈME"
 
-ask "Nom d'hôte (hostname)" "ubuntoutou"
-HOSTNAME="$REPLY"
+while true; do
+    ask "Nom d'hôte (hostname)" "Ubuntu"
+    validate_hostname "$REPLY" && HOSTNAME="$REPLY" && break
+done
 
-ask "Nom d'utilisateur" "cyber"
-USERNAME="$REPLY"
+while true; do
+    ask "Nom d'utilisateur" "user"
+    validate_username "$REPLY" && USERNAME="$REPLY" && break
+done
 
-ask "Nom complet (GECOS, laisser vide si inutile)" ""
-REALNAME="$REPLY"
+ask "Nom complet (GECOS, laisser vide = même que username)" ""
+REALNAME="${REPLY:-$USERNAME}"
 
 ask_password "Mot de passe utilisateur"
 PASSWORD_USER="$REPLY"
@@ -210,13 +253,25 @@ fi
 section "3. DISQUE"
 
 list_disks
-ask "Disque cible" "/dev/sda"
-DISK="$REPLY"
+while true; do
+    ask "Disque cible" "/dev/sda"
+    validate_disk "$REPLY" && DISK="$REPLY" && break
+done
 
 # =============================================================
-# 4. TYPE DE STOCKAGE
+# 4. PROFIL D'INSTALLATION
 # =============================================================
-section "4. TYPE DE STOCKAGE"
+section "4. PROFIL D'INSTALLATION"
+
+choose "Profil" \
+    "Desktop (GNOME, NetworkManager)" \
+    "Serveur (sans GUI, networkd)"
+PROFILE=$CHOICE
+
+# =============================================================
+# 5. TYPE DE STOCKAGE
+# =============================================================
+section "5. TYPE DE STOCKAGE"
 
 choose "Type de partitionnement" \
     "LVM (Logical Volume Manager)" \
@@ -235,11 +290,11 @@ FS_ROOT="$FS_MAIN"
 FS_HOME="$FS_MAIN"
 
 # =============================================================
-# 5. TAILLES DES PARTITIONS
+# 6. TAILLES DES PARTITIONS
 # =============================================================
-section "5. TAILLES DES PARTITIONS"
+section "6. TAILLES DES PARTITIONS"
 
-echo -e "  ${YLW}Format attendu : 512M, 1G, 30G, etc. (-1 = reste du disque)${RST}"
+echo -e "  ${YLW}Format attendu : 512M, 1G, 30G, etc. (/home prend le reste automatiquement)${RST}"
 
 while true; do
     ask "Taille partition EFI" "512M"
@@ -268,11 +323,10 @@ done
 echo -e "  ${GRN}  → /home prendra automatiquement le reste du disque${RST}"
 
 # =============================================================
-# 6. LVM
+# 7. LVM
 # =============================================================
-section "6. LVM (si applicable)"
-
 if [[ $STORAGE_TYPE -eq 1 ]]; then
+    section "7. LVM"
     ask "Nom du Volume Group" "vg-ubuntu"
     LVM_VG="$REPLY"
     ask "Nom LV swap" "lv-swap"
@@ -281,12 +335,17 @@ if [[ $STORAGE_TYPE -eq 1 ]]; then
     LVM_LV_ROOT="$REPLY"
     ask "Nom LV home" "lv-home"
     LVM_LV_HOME="$REPLY"
+else
+    LVM_VG=""
+    LVM_LV_SWAP=""
+    LVM_LV_ROOT=""
+    LVM_LV_HOME=""
 fi
 
 # =============================================================
-# 7. NOYAU & RÉSEAU
+# 8. NOYAU & RÉSEAU
 # =============================================================
-section "7. NOYAU & RÉSEAU"
+section "8. NOYAU & RÉSEAU"
 
 choose "Flaveur du noyau" \
     "hwe (Hardware Enablement — recommandé desktop)" \
@@ -296,18 +355,18 @@ case $CHOICE in
 2) KERNEL_FLAVOR="generic" ;;
 esac
 
-choose "Gestionnaire réseau" \
-    "NetworkManager (desktop/laptop)" \
-    "networkd (serveur)"
-case $CHOICE in
-1) NETWORK_RENDERER="NetworkManager" ;;
-2) NETWORK_RENDERER="networkd" ;;
-esac
+if [[ $PROFILE -eq 1 ]]; then
+    NETWORK_RENDERER="NetworkManager"
+    echo -e "  ${GRN}  → Profil Desktop : NetworkManager sélectionné automatiquement${RST}"
+else
+    NETWORK_RENDERER="networkd"
+    echo -e "  ${GRN}  → Profil Serveur : networkd sélectionné automatiquement${RST}"
+fi
 
 # =============================================================
-# 8. GRUB
+# 9. GRUB
 # =============================================================
-section "8. GRUB"
+section "9. GRUB"
 
 ask "Options kernel (GRUB_CMDLINE_LINUX_DEFAULT)" "quiet splash"
 GRUB_CMDLINE="$REPLY"
@@ -332,21 +391,20 @@ case $CHOICE in
 esac
 
 yes_no "Désactiver la détection dual-boot (os-prober) ?" "o"
-GRUB_DISABLE_OS_PROBER="$REPLY"
 [[ "$REPLY" == "yes" ]] && GRUB_DISABLE_OS_PROBER="true" || GRUB_DISABLE_OS_PROBER="false"
 
 # =============================================================
-# 9. SSH
+# 10. SSH
 # =============================================================
-section "9. SSH"
+section "10. SSH"
 
 yes_no "Autoriser login SSH en root ?" "o"
 [[ "$REPLY" == "yes" ]] && SSH_ROOT_LOGIN="yes" || SSH_ROOT_LOGIN="no"
 
 # =============================================================
-# 10. MISES À JOUR AUTOMATIQUES
+# 11. MISES À JOUR AUTOMATIQUES
 # =============================================================
-section "10. MISES À JOUR AUTOMATIQUES"
+section "11. MISES À JOUR AUTOMATIQUES"
 
 choose "Mises à jour automatiques" \
     "security (sécurité uniquement — recommandé)" \
@@ -359,12 +417,27 @@ case $CHOICE in
 esac
 
 # =============================================================
-# 11. PAQUETS SUPPLÉMENTAIRES
+# 12. OUTILS VMware
 # =============================================================
-section "11. PAQUETS SUPPLÉMENTAIRES"
+section "12. OUTILS VMware"
 
-echo -e "  ${YLW}Paquets de base inclus : curl git vim htop net-tools openssh-server wget unzip${RST}"
-echo -e "  ${YLW}bash-completion tree lsof dnsutils nmap tcpdump open-vm-tools-desktop gnome-tweaks${RST}"
+yes_no "Installer open-vm-tools (machine virtuelle VMware/vSphere) ?" "n"
+INSTALL_VMTOOLS="$REPLY"
+
+# =============================================================
+# 13. PAQUETS SUPPLÉMENTAIRES
+# =============================================================
+section "13. PAQUETS SUPPLÉMENTAIRES"
+
+if [[ $PROFILE -eq 1 ]]; then
+    echo -e "  ${YLW}Paquets déjà inclus (Desktop) — ne pas les re-déclarer en extras :${RST}"
+    echo -e "  ${YLW}  ubuntu-desktop curl git vim htop net-tools openssh-server wget unzip zip${RST}"
+    echo -e "  ${YLW}  bash-completion tree lsof dnsutils traceroute whois nmap tcpdump gnome-tweaks${RST}"
+else
+    echo -e "  ${YLW}Paquets déjà inclus (Serveur) — ne pas les re-déclarer en extras :${RST}"
+    echo -e "  ${YLW}  curl git vim htop net-tools openssh-server wget unzip zip${RST}"
+    echo -e "  ${YLW}  bash-completion tree lsof dnsutils traceroute whois nmap tcpdump${RST}"
+fi
 
 yes_no "Ajouter des paquets supplémentaires ?" "n"
 EXTRA_PKG_LIST=""
@@ -373,27 +446,39 @@ if [[ "$REPLY" == "yes" ]]; then
     echo -ne "  ➜ "
     read -r extra_pkgs
     for pkg in $extra_pkgs; do
-        EXTRA_PKG_LIST="${EXTRA_PKG_LIST}\n    - ${pkg}"
+        EXTRA_PKG_LIST="${EXTRA_PKG_LIST}
+    - ${pkg}"
     done
 fi
 
-yes_no "Ajouter des snaps supplémentaires ?" "n"
-EXTRA_SNAP_LIST=""
-if [[ "$REPLY" == "yes" ]]; then
-    echo -e "  ${BLD}Entrez les snaps séparés par des espaces :${RST}"
-    echo -ne "  ➜ "
-    read -r extra_snaps
-    for snap in $extra_snaps; do
-        EXTRA_SNAP_LIST="${EXTRA_SNAP_LIST}\n    - name: ${snap}"
-    done
+if [[ $PROFILE -eq 1 ]]; then
+    yes_no "Conserver le snap Firefox ET installer le .deb Mozilla APT ?" "n"
+    KEEP_SNAP_FIREFOX="$REPLY"
+    yes_no "Ajouter des snaps supplémentaires ?" "n"
+    EXTRA_SNAP_LIST=""
+    if [[ "$REPLY" == "yes" ]]; then
+        echo -e "  ${BLD}Entrez les snaps séparés par des espaces :${RST}"
+        echo -ne "  ➜ "
+        read -r extra_snaps
+        for snap in $extra_snaps; do
+            EXTRA_SNAP_LIST="${EXTRA_SNAP_LIST}
+    - name: ${snap}"
+        done
+    fi
+else
+    EXTRA_SNAP_LIST=""
 fi
 
+# =============================================================
+# RÉCAPITULATIF
+# =============================================================
 echo ""
 echo -e "${GRN}${BLD}"
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║                     RÉCAPITULATIF                       ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${RST}"
+echo -e "  Profil          : ${BLD}$([[ $PROFILE -eq 1 ]] && echo "Desktop" || echo "Serveur")${RST}"
 echo -e "  Hostname        : ${BLD}$HOSTNAME${RST}"
 echo -e "  Utilisateur     : ${BLD}$USERNAME${RST}"
 echo -e "  Locale          : ${BLD}$LOCALE${RST}  Clavier: ${BLD}$KEYBOARD${KEYBOARD_VARIANT:+/$KEYBOARD_VARIANT}${RST}"
@@ -403,6 +488,7 @@ echo -e "  Stockage        : ${BLD}$([[ $STORAGE_TYPE -eq 1 ]] && echo "LVM" || 
 echo -e "  Partitions      : EFI=${BLD}$SIZE_EFI${RST}  boot=${BLD}$SIZE_BOOT${RST}  swap=${BLD}$SIZE_SWAP${RST}  root=${BLD}$SIZE_ROOT${RST}  home=reste"
 echo -e "  Noyau           : ${BLD}$KERNEL_FLAVOR${RST}  Réseau: ${BLD}$NETWORK_RENDERER${RST}"
 echo -e "  SSH root        : ${BLD}$SSH_ROOT_LOGIN${RST}  Updates: ${BLD}$AUTO_UPDATES${RST}"
+echo -e "  VMware tools    : ${BLD}$INSTALL_VMTOOLS${RST}"
 echo ""
 
 yes_no "Générer le fichier autoinstall.yaml ?" "o" || {
@@ -410,11 +496,87 @@ yes_no "Générer le fichier autoinstall.yaml ?" "o" || {
     exit 0
 }
 
-HASH_USER=$(openssl passwd -6 "$PASSWORD_USER")
-HASH_ROOT=$(openssl passwd -6 "$PASSWORD_ROOT")
+# =============================================================
+# HACHAGE DES MOTS DE PASSE (avant écriture, pas de sed)
+# =============================================================
+echo -e "  ${YLW}Calcul des hachages...${RST}"
+HASH_USER=$(hash_password "$PASSWORD_USER")
+HASH_ROOT=$(hash_password "$PASSWORD_ROOT")
+
+# =============================================================
+# CONSTRUCTION DU YAML
+# =============================================================
+
+# Paquets selon profil
+if [[ $PROFILE -eq 1 ]]; then
+    PROFILE_PKG="
+    - ubuntu-desktop"
+    if [[ "$INSTALL_VMTOOLS" == "yes" ]]; then
+        PROFILE_PKG="${PROFILE_PKG}
+    - open-vm-tools-desktop"
+    fi
+else
+    PROFILE_PKG=""
+    if [[ "$INSTALL_VMTOOLS" == "yes" ]]; then
+        PROFILE_PKG="
+    - open-vm-tools"
+    fi
+fi
+
+BASE_PACKAGES="
+    - curl
+    - git
+    - vim
+    - htop
+    - net-tools
+    - openssh-server
+    - bash-completion
+    - wget
+    - unzip
+    - zip
+    - tree
+    - lsof
+    - dnsutils
+    - traceroute
+    - whois
+    - nmap
+    - tcpdump"
+
+if [[ $PROFILE -eq 1 ]]; then
+    BASE_PACKAGES="${BASE_PACKAGES}
+    - gnome-tweaks"
+fi
+
+ALL_PACKAGES="${PROFILE_PKG}${BASE_PACKAGES}${EXTRA_PKG_LIST}"
+
+if [[ $PROFILE -eq 1 ]]; then
+    if [[ "$KEEP_SNAP_FIREFOX" == "yes" ]]; then
+        BASE_SNAPS="
+    - name: firefox
+    - name: gtk-common-themes
+    - name: snap-store
+    - name: snapd-desktop-integration"
+    else
+        BASE_SNAPS="
+    - name: gtk-common-themes
+    - name: snap-store
+    - name: snapd-desktop-integration"
+    fi
+    ALL_SNAPS="${BASE_SNAPS}${EXTRA_SNAP_LIST}"
+fi
+
+OUTPUT="$(dirname "$0")/autoinstall.yaml"
+
+# Avertir si fichier existant
+if [[ -f "$OUTPUT" ]]; then
+    yes_no "⚠  $OUTPUT existe déjà. Écraser ?" "n" || {
+        echo -e "${RED}Annulé.${RST}"
+        exit 0
+    }
+fi
 
 build_storage_lvm() {
-    cat <<STORAGE
+cat <<STORAGE
   storage:
     version: 1
     config:
@@ -436,12 +598,14 @@ build_storage_lvm() {
         id: part-boot
         device: disk0
         size: ${SIZE_BOOT}
+        wipe: superblock
 
       - type: partition
         id: part-lvm
         device: disk0
         size: -1
         flag: linux-lvm
+        wipe: superblock
 
       - type: lvm_volgroup
         id: vg0
@@ -450,19 +614,19 @@ build_storage_lvm() {
           - part-lvm
 
       - type: lvm_partition
-        id: ${LVM_LV_SWAP}
+        id: lv-swap-id
         volgroup: vg0
         name: ${LVM_LV_SWAP}
         size: ${SIZE_SWAP}
 
       - type: lvm_partition
-        id: ${LVM_LV_ROOT}
+        id: lv-root-id
         volgroup: vg0
         name: ${LVM_LV_ROOT}
         size: ${SIZE_ROOT}
 
       - type: lvm_partition
-        id: ${LVM_LV_HOME}
+        id: lv-home-id
         volgroup: vg0
         name: ${LVM_LV_HOME}
         size: -1
@@ -481,19 +645,19 @@ build_storage_lvm() {
 
       - type: format
         id: fmt-swap
-        volume: ${LVM_LV_SWAP}
+        volume: lv-swap-id
         fstype: swap
         label: swap
 
       - type: format
         id: fmt-root
-        volume: ${LVM_LV_ROOT}
+        volume: lv-root-id
         fstype: ${FS_ROOT}
         label: root
 
       - type: format
         id: fmt-home
-        volume: ${LVM_LV_HOME}
+        volume: lv-home-id
         fstype: ${FS_HOME}
         label: home
 
@@ -525,7 +689,7 @@ STORAGE
 }
 
 build_storage_direct() {
-    cat <<STORAGE
+cat <<STORAGE
   storage:
     version: 1
     config:
@@ -547,21 +711,25 @@ build_storage_direct() {
         id: part-boot
         device: disk0
         size: ${SIZE_BOOT}
+        wipe: superblock
 
       - type: partition
         id: part-swap
         device: disk0
         size: ${SIZE_SWAP}
+        wipe: superblock
 
       - type: partition
         id: part-root
         device: disk0
         size: ${SIZE_ROOT}
+        wipe: superblock
 
       - type: partition
         id: part-home
         device: disk0
         size: -1
+        wipe: superblock
 
       - type: format
         id: fmt-efi
@@ -620,59 +788,37 @@ build_storage_direct() {
 STORAGE
 }
 
-BASE_PACKAGES="
-    - curl
-    - git
-    - vim
-    - htop
-    - net-tools
-    - open-vm-tools-desktop
-    - openssh-server
-    - bash-completion
-    - wget
-    - unzip
-    - zip
-    - tree
-    - lsof
-    - dnsutils
-    - traceroute
-    - whois
-    - nmap
-    - tcpdump
-    - gnome-tweaks"
-
-ALL_PACKAGES="${BASE_PACKAGES}${EXTRA_PKG_LIST}"
-
-BASE_SNAPS="
-    - name: firefox
-    - name: gtk-common-themes
-    - name: snap-store
-    - name: snapd-desktop-integration"
-
-ALL_SNAPS="${BASE_SNAPS}${EXTRA_SNAP_LIST}"
-
-OUTPUT="$(dirname "$0")/autoinstall.yaml"
-
+# Écriture du fichier YAML — les hashes sont injectés directement
+# sans passer par sed, évitant tout problème avec les caractères spéciaux
 {
-    cat <<HEADER
+cat <<HEADER
 #cloud-config
 # -------------------------------------------------------
 # Généré par generate.sh — NE PAS MODIFIER DIRECTEMENT
 # Ubuntu 26.04 LTS Resolute Raccoon
-# Stockage : $([[ $STORAGE_TYPE -eq 1 ]] && echo "LVM" || echo "Direct") / FS : ${FS_MAIN}
+# Profil  : $([[ $PROFILE -eq 1 ]] && echo "Desktop" || echo "Serveur")
+# Stockage: $([[ $STORAGE_TYPE -eq 1 ]] && echo "LVM" || echo "Direct") / FS : ${FS_MAIN}
 # -------------------------------------------------------
 autoinstall:
   version: 1
 
-  packages:
-    - ubuntu-desktop${ALL_PACKAGES}
+  packages:${ALL_PACKAGES}
 
+HEADER
+
+# Snaps uniquement en mode Desktop
+if [[ $PROFILE -eq 1 ]]; then
+cat <<SNAPS
   snaps:${ALL_SNAPS}
 
+SNAPS
+fi
+
+cat <<IDENTITY
   identity:
     realname: '${REALNAME}'
     username: ${USERNAME}
-    password: "USERHASHPLACEHOLDER"
+    password: "${HASH_USER}"
     hostname: ${HOSTNAME}
 
   keyboard:
@@ -691,20 +837,23 @@ autoinstall:
         dhcp4: true
     version: 2
 
-HEADER
+IDENTITY
 
-    if [[ $STORAGE_TYPE -eq 1 ]]; then
-        build_storage_lvm
-    else
-        build_storage_direct
-    fi
+if [[ $STORAGE_TYPE -eq 1 ]]; then
+    build_storage_lvm
+else
+    build_storage_direct
+fi
 
-    cat <<FOOTER
+# user-data : format cloud-init moderne (chpasswd v2)
+cat <<USERDATA
 
   user-data:
     chpasswd:
-      list: |
-        root:ROOTHASHPLACEHOLDER
+      users:
+        - name: root
+          password: "${HASH_ROOT}"
+          type: text
       expire: false
     users:
       - name: root
@@ -713,14 +862,23 @@ HEADER
   kernel:
     flavor: ${KERNEL_FLAVOR}
 
+USERDATA
+
+# late-commands : construction propre sans sed sur variables utilisateur
+# Les valeurs GRUB sont écrites via printf pour éviter les injections
+cat <<'LATECOMMANDS_OPEN'
   late-commands:
       - curtin in-target -- add-apt-repository universe -y
       - curtin in-target -- add-apt-repository multiverse -y
       - curtin in-target -- add-apt-repository restricted -y
-      - >-
-        curtin in-target --
-        sed -i /etc/default/grub -e
-        's/GRUB_CMDLINE_LINUX_DEFAULT=".*/GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE}"/'
+LATECOMMANDS_OPEN
+
+# GRUB_CMDLINE via printf (évite les problèmes de / = dans sed)
+printf "      - >-\n"
+printf "        sh -c 'printf %%s\\\\n \"%s\" > /target/etc/default/grub.d/99-autoinstall.cfg'\n" \
+    "GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_CMDLINE}\""
+
+cat <<LATECOMMANDS_GRUB
       - >-
         curtin in-target --
         sed -i /etc/default/grub -e
@@ -738,33 +896,61 @@ HEADER
         sed -i /etc/default/grub -e
         's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=${GRUB_DISABLE_OS_PROBER}/'
       - curtin in-target -- update-grub
-      - rm /target/etc/netplan/00-installer-config*yaml
+      - rm -f /target/etc/netplan/00-installer-config*.yaml
       - >-
-        printf "network:\n  version: 2\n  renderer: ${NETWORK_RENDERER}"
-        > /target/etc/netplan/01-network-manager-all.yaml
+        printf "network:\n  version: 2\n  renderer: ${NETWORK_RENDERER}\n"
+        > /target/etc/netplan/01-network.yaml
       - >-
         curtin in-target -- sed -i
         's/^#\?PermitRootLogin.*/PermitRootLogin ${SSH_ROOT_LOGIN}/'
         /etc/ssh/sshd_config
       - >-
         curtin in-target -- apt-get remove -y
-        ubuntu-server
-        motd-news-config lxd-agent-loader
-        landscape-common
+        motd-news-config lxd-agent-loader landscape-common || true
       - curtin in-target -- apt-get autoremove -y
+LATECOMMANDS_GRUB
+
+# Firefox via Mozilla APT
+if [[ $PROFILE -eq 1 ]]; then
+cat <<'FIREFOX_CMDS'
+      - install -d -m 0755 /target/etc/apt/keyrings
+      - >-
+        wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg
+        -O /target/etc/apt/keyrings/packages.mozilla.org.asc
+      - >-
+        sh -c 'gpg -n -q --import --import-options import-show
+        /target/etc/apt/keyrings/packages.mozilla.org.asc 2>&1
+        | grep -q 35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3
+        && echo "Mozilla GPG fingerprint OK"
+        || echo "WARNING: Mozilla GPG fingerprint mismatch"'
+      - >-
+        printf 'Types: deb\nURIs: https://packages.mozilla.org/apt\nSuites: mozilla\nComponents: main\nSigned-By: /etc/apt/keyrings/packages.mozilla.org.asc\n'
+        > /target/etc/apt/sources.list.d/mozilla.sources
+      - >-
+        printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n'
+        > /target/etc/apt/preferences.d/mozilla
+      - curtin in-target -- apt-get update
+      - curtin in-target -- apt-get install -y firefox
+FIREFOX_CMDS
+fi
+
+cat <<LATECOMMANDS_END
+
+  error-commands:
+      - echo "=== ERREUR AUTOINSTALL ===" >> /var/log/autoinstall-error.log
+      - journalctl -n 100 >> /var/log/autoinstall-error.log || true
 
   updates: ${AUTO_UPDATES}
 
   shutdown: reboot
-FOOTER
-} >"$OUTPUT"
+LATECOMMANDS_END
 
-sed -i "s|USERHASHPLACEHOLDER|${HASH_USER}|g" "$OUTPUT"
-sed -i "s|ROOTHASHPLACEHOLDER|${HASH_ROOT}|g" "$OUTPUT"
+} > "$OUTPUT"
 
 echo ""
 echo -e "${GRN}${BLD}✓ autoinstall.yaml généré avec succès !${RST}"
 echo -e "  Fichier : ${BLD}$OUTPUT${RST}"
+echo -e "  Profil  : ${BLD}$([[ $PROFILE -eq 1 ]] && echo "Desktop" || echo "Serveur")${RST}"
 echo -e "  Hostname: ${BLD}$HOSTNAME${RST}  User: ${BLD}$USERNAME${RST}  Disque: ${BLD}$DISK${RST}"
 echo -e "  Stockage: ${BLD}$([[ $STORAGE_TYPE -eq 1 ]] && echo "LVM" || echo "Direct")${RST}  FS: ${BLD}$FS_MAIN${RST}"
 echo ""
