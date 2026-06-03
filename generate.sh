@@ -390,7 +390,7 @@ case $CHOICE in
 2) GRUB_TERMINAL="gfxterm" ;;
 esac
 
-yes_no "Désactiver la détection dual-boot (os-prober) ?" "o"
+yes_no "Désactiver la détection dual-boot (os-prober) ?" "o" || true
 [[ "$REPLY" == "yes" ]] && GRUB_DISABLE_OS_PROBER="true" || GRUB_DISABLE_OS_PROBER="false"
 
 # =============================================================
@@ -398,7 +398,7 @@ yes_no "Désactiver la détection dual-boot (os-prober) ?" "o"
 # =============================================================
 section "10. SSH"
 
-yes_no "Autoriser login SSH en root ?" "o"
+yes_no "Autoriser login SSH en root ?" "o" || true
 [[ "$REPLY" == "yes" ]] && SSH_ROOT_LOGIN="yes" || SSH_ROOT_LOGIN="no"
 
 # =============================================================
@@ -421,7 +421,7 @@ esac
 # =============================================================
 section "12. OUTILS VMware"
 
-yes_no "Installer open-vm-tools (machine virtuelle VMware/vSphere) ?" "n"
+yes_no "Installer open-vm-tools (machine virtuelle VMware/vSphere) ?" "n" || true
 INSTALL_VMTOOLS="$REPLY"
 
 # =============================================================
@@ -439,7 +439,7 @@ else
     echo -e "  ${YLW}  bash-completion tree lsof dnsutils traceroute whois nmap tcpdump${RST}"
 fi
 
-yes_no "Ajouter des paquets supplémentaires ?" "n"
+yes_no "Ajouter des paquets supplémentaires ?" "n" || true
 EXTRA_PKG_LIST=""
 if [[ "$REPLY" == "yes" ]]; then
     echo -e "  ${BLD}Entrez les paquets séparés par des espaces :${RST}"
@@ -452,9 +452,9 @@ if [[ "$REPLY" == "yes" ]]; then
 fi
 
 if [[ $PROFILE -eq 1 ]]; then
-    yes_no "Conserver le snap Firefox ET installer le .deb Mozilla APT ?" "n"
+    yes_no "Conserver le snap Firefox ET installer le .deb Mozilla APT ?" "n" || true
     KEEP_SNAP_FIREFOX="$REPLY"
-    yes_no "Ajouter des snaps supplémentaires ?" "n"
+    yes_no "Ajouter des snaps supplémentaires ?" "n" || true
     EXTRA_SNAP_LIST=""
     if [[ "$REPLY" == "yes" ]]; then
         echo -e "  ${BLD}Entrez les snaps séparés par des espaces :${RST}"
