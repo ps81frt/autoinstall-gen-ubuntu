@@ -802,6 +802,12 @@ cat <<HEADER
 autoinstall:
   version: 1
 
+  early-commands:
+      # Désactive multipathd avant la détection des disques pour éviter
+      # l'erreur "failed to run cmd multipathd, show path raw format"
+      - systemctl stop multipathd || true
+      - systemctl mask multipathd || true
+
   packages:${ALL_PACKAGES}
 
 HEADER
