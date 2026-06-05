@@ -21,10 +21,21 @@ for cmd in openssl lsblk; do
     }
 done
 
+# =============================================================
+# DÉTECTION UEFI / LEGACY
+# =============================================================
+detect_firmware() {
+    if [[ -d /sys/firmware/efi ]]; then
+        echo "uefi"
+    else
+        echo "legacy"
+    fi
+}
+
 banner() {
     echo -e "${BLU}${BLD}"
     echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║     Générateur autoinstall.yaml — Ubuntu 26.04 LTS      ║"
+    echo "║     Générateur autoinstall.yaml — Ubuntu 26.04 LTS       ║"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo -e "${RST}"
 }
@@ -141,9 +152,19 @@ validate_disk() {
     return 1
 }
 
-# Encode un hash SHA-512 de façon sûre pour YAML (pas de sed)
 hash_password() {
     openssl passwd -6 "$1"
+}
+
+detect_lvm_on_disk() {
+    local disk="$1"
+    # Cherche des PV LVM sur le disque (partitions ou disque entier)
+    if command -v pvs &>/dev/null; then
+        pvs --noheadings -o pv_name 2>/dev/null | grep -q "^[[:space:]]*${disk}" && return 0
+    fi
+    # Fallback : lire les types de partitions via lsblk
+    lsblk -pno NAME,FSTYPE "$disk" 2>/dev/null | grep -q "LVM2_member" && return 0
+    return 1
 }
 
 list_disks() {
@@ -258,6 +279,170 @@ while true; do
     validate_disk "$REPLY" && DISK="$REPLY" && break
 done
 
+DETECTED_FW=$(detect_firmware)
+echo ""
+if [[ "$DETECTED_FW" == "uefi" ]]; then
+    echo -e "  ${GRN}✓ Firmware détecté : ${BLD}UEFI${RST}${GRN} — partition EFI + table GPT${RST}"
+else
+    echo -e "  ${YLW}⚠ Firmware détecté : ${BLD}Legacy BIOS${RST}${YLW} — pas de partition EFI${RST}"
+fi
+echo -e "  ${CYN}  (détection via /sys/firmware/efi — normalement fiable sur la machine courante)${RST}"
+echo ""
+echo -e "  ${YLW}⚠ Forcer un mauvais mode génère un YAML incorrect → install plantera${RST}"
+echo -e "  ${BLD}  Impact selon le mode choisi :${RST}"
+echo -e "    ${BLD}UEFI${RST}        → disque entier : EFI vfat créée + GPT"
+echo -e "                → dual-boot   : EFI existante réutilisée (preserve, non reformatée)"
+echo -e "    ${BLD}Legacy GPT${RST}  → disque entier : bios_grub 1M créée + GPT (pas d'EFI)"
+echo -e "                → dual-boot   : bios_grub 1M ajoutée + GPT preservée"
+echo -e "    ${BLD}Legacy MBR${RST}  → disque entier : table msdos + flag boot sur /boot (pas d'EFI)"
+echo -e "                → dual-boot   : table msdos preservée + flag boot sur /boot"
+echo ""
+yes_no "La détection est incorrecte, forcer un autre mode ?" "n" || true
+if [[ "$REPLY" == "yes" ]]; then
+    choose "Mode firmware à utiliser" \
+        "UEFI (partition EFI vfat, table GPT)" \
+        "Legacy BIOS + GPT (partition bios_grub 1M, table GPT)" \
+        "Legacy BIOS + MBR (table msdos, flag boot)"
+    case $CHOICE in
+    1) FIRMWARE_MODE="uefi" ; LEGACY_PTABLE="" ;;
+    2) FIRMWARE_MODE="legacy" ; LEGACY_PTABLE="gpt" ;;
+    3) FIRMWARE_MODE="legacy" ; LEGACY_PTABLE="mbr" ;;
+    esac
+    echo -e "  ${YLW}⚠ Mode forcé : ${BLD}${FIRMWARE_MODE^^}${LEGACY_PTABLE:+ / ${LEGACY_PTABLE^^}}${RST}"
+else
+    FIRMWARE_MODE="$DETECTED_FW"
+fi
+
+if [[ "$FIRMWARE_MODE" == "legacy" ]]; then
+    echo ""
+    choose "Type de table de partitions (Legacy BIOS)" \
+        "GPT  (recommandé, nécessite une partition bios_grub 1M — générée automatiquement)" \
+        "MBR/msdos  (compatibilité maximale, anciens systèmes)"
+    case $CHOICE in
+    1) LEGACY_PTABLE="gpt" ;;
+    2) LEGACY_PTABLE="mbr" ;;
+    esac
+else
+    LEGACY_PTABLE=""
+fi
+
+LVM_DETECTED="no"
+if detect_lvm_on_disk "$DISK"; then
+    LVM_DETECTED="yes"
+    echo ""
+    echo -e "  ${RED}${BLD}⚠ ATTENTION : LVM détecté sur $DISK${RST}"
+    echo -e "  ${YLW}Des volumes logiques (LV) existent déjà sur ce disque.${RST}"
+    echo -e "  ${YLW}• Si vous installez en mode ${BLD}disque entier${RST}${YLW} : tous les VG/LV seront détruits.${RST}"
+    echo -e "  ${YLW}• Si vous installez en mode ${BLD}dual-boot${RST}${YLW} : les LV non déclarés dans le YAML"
+    echo -e "    ${YLW}  seront purgés par curtin (comportement natif d'autoinstall).${RST}"
+    echo -e "  ${YLW}  Vérifiez vos VG/LV existants :${RST}"
+    echo ""
+    if command -v vgs &>/dev/null; then
+        vgs --noheadings -o vg_name,lv_count,vg_size 2>/dev/null | awk '{printf "    VG: %-20s  LVs: %s  Taille: %s\n", $1, $2, $3}' || true
+        echo ""
+        lvs --noheadings -o lv_name,vg_name,lv_size,lv_path 2>/dev/null | awk '{printf "    LV: %-20s  VG: %-15s  Taille: %-8s  %s\n", $1, $2, $3, $4}' || true
+    else
+        lsblk -pno NAME,SIZE,FSTYPE "$DISK" 2>/dev/null | grep "LVM2_member" | awk '{printf "    PV: %s  (%s)\n", $1, $2}' || true
+    fi
+    echo ""
+    yes_no "Confirmer : vous avez pris note des LV existants et acceptez leur suppression éventuelle ?" "n" || {
+        echo -e "${RED}Annulé. Sauvegardez vos données LVM avant de relancer.${RST}"
+        exit 1
+    }
+fi
+
+# =============================================================
+# 3bis. DUAL-BOOT
+# =============================================================
+section "3bis. DUAL-BOOT"
+
+choose "Mode d'installation" \
+    "Seul (disque entier effacé)" \
+    "Dual-boot (conserver OS existant, utiliser espace libre)"
+DUALBOOT=$CHOICE
+
+if [[ $DUALBOOT -eq 2 ]]; then
+    echo ""
+    echo -e "  ${YLW}Partitions actuelles sur $DISK :${RST}"
+    lsblk -pno NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT "$DISK" 2>/dev/null || true
+    echo ""
+
+    # Avertissement spécifique LVM + dual-boot
+    if [[ "$LVM_DETECTED" == "yes" ]]; then
+        echo -e "  ${RED}${BLD}⚠ DUAL-BOOT + LVM : risque de perte de données${RST}"
+        echo -e "  ${YLW}  Curtin (autoinstall) purge les LV non explicitement déclarés dans le YAML.${RST}"
+        echo -e "  ${YLW}  Tous les LV existants non listés seront ${BLD}détruits sans avertissement${RST}${YLW}.${RST}"
+        echo -e "  ${YLW}  Assurez-vous d'avoir sauvegardé toutes les données LVM importantes.${RST}"
+        echo ""
+        yes_no "Confirmer la poursuite malgré le risque LVM en dual-boot ?" "n" || {
+            echo -e "${RED}Annulé.${RST}"
+            exit 1
+        }
+    fi
+
+    DISK_P=""
+    [[ "$DISK" =~ (nvme|mmcblk) ]] && DISK_P="p"
+    if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+        echo -e "  ${YLW}La partition EFI existante sera réutilisée (pas reformatée).${RST}"
+        while true; do
+            ask "Partition EFI existante (ex: ${DISK}${DISK_P}1)" "${DISK}${DISK_P}1"
+            [[ -b "$REPLY" ]] && EFI_EXISTING="$REPLY" && break
+            echo -e "${RED}  ✗ Partition introuvable.${RST}"
+        done
+    else
+        EFI_EXISTING=""
+        echo -e "  ${YLW}Mode Legacy : pas de partition EFI.${RST}"
+        if [[ "$LEGACY_PTABLE" == "gpt" ]]; then
+            echo -e "  ${GRN}  → Une partition bios_grub (1M) sera insérée automatiquement.${RST}"
+        fi
+    fi
+
+    yes_no "Créer une partition /boot dédiée ?" "o" || true
+    DUALBOOT_BOOT="$REPLY"
+
+    echo -e "  ${YLW}Indiquez la partition (vide = créer dans l'espace libre) ou son numéro de début/fin.${RST}"
+    echo -e "  ${YLW}Le plus simple : pré-allouer l'espace libre depuis l'OS existant avant de lancer l'install.${RST}"
+
+    yes_no "Avez-vous une partition Linux vide pré-allouée pour / ?" "n" || true
+    if [[ "$REPLY" == "yes" ]]; then
+        while true; do
+            ask "Partition pour / (root)" "${DISK}${DISK_P}3"
+            [[ -b "$REPLY" ]] && DUALBOOT_ROOT_PART="$REPLY" && break
+            echo -e "${RED}  ✗ Partition introuvable.${RST}"
+        done
+        DUALBOOT_ROOT_PREALLOC="yes"
+    else
+        DUALBOOT_ROOT_PREALLOC="no"
+        DUALBOOT_ROOT_PART=""
+    fi
+
+    yes_no "Avez-vous une partition Linux vide pré-allouée pour /home ?" "n" || true
+    if [[ "$REPLY" == "yes" ]]; then
+        while true; do
+            ask "Partition pour /home" "${DISK}${DISK_P}4"
+            [[ -b "$REPLY" ]] && DUALBOOT_HOME_PART="$REPLY" && break
+            echo -e "${RED}  ✗ Partition introuvable.${RST}"
+        done
+        DUALBOOT_HOME_PREALLOC="yes"
+    else
+        DUALBOOT_HOME_PREALLOC="no"
+        DUALBOOT_HOME_PART=""
+    fi
+
+    yes_no "Avez-vous une partition swap Linux vide pré-allouée ?" "n" || true
+    if [[ "$REPLY" == "yes" ]]; then
+        while true; do
+            ask "Partition swap" "${DISK}${DISK_P}5"
+            [[ -b "$REPLY" ]] && DUALBOOT_SWAP_PART="$REPLY" && break
+            echo -e "${RED}  ✗ Partition introuvable.${RST}"
+        done
+        DUALBOOT_SWAP_PREALLOC="yes"
+    else
+        DUALBOOT_SWAP_PREALLOC="no"
+        DUALBOOT_SWAP_PART=""
+    fi
+fi
+
 # =============================================================
 # 4. PROFIL D'INSTALLATION
 # =============================================================
@@ -296,29 +481,58 @@ section "6. TAILLES DES PARTITIONS"
 
 echo -e "  ${YLW}Format attendu : 512M, 1G, 30G, etc. (/home prend le reste automatiquement)${RST}"
 
-while true; do
-    ask "Taille partition EFI" "512M"
-    SIZE_EFI="$REPLY"
-    validate_size "$SIZE_EFI" && break
-done
+if [[ $DUALBOOT -eq 1 ]]; then
+    if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+        while true; do
+            ask "Taille partition EFI" "512M"
+            SIZE_EFI="$REPLY"
+            validate_size "$SIZE_EFI" && break
+        done
+    else
+        SIZE_EFI=""
+        if [[ "$LEGACY_PTABLE" == "gpt" ]]; then
+            echo -e "  ${GRN}  → EFI ignorée (Legacy) ; partition bios_grub 1M générée automatiquement${RST}"
+        else
+            echo -e "  ${GRN}  → EFI ignorée (Legacy MBR)${RST}"
+        fi
+    fi
+else
+    SIZE_EFI=""
+    echo -e "  ${GRN}  → EFI : partition existante réutilisée (${EFI_EXISTING})${RST}"
+fi
 
-while true; do
-    ask "Taille partition /boot" "1G"
-    SIZE_BOOT="$REPLY"
-    validate_size "$SIZE_BOOT" && break
-done
+if [[ $DUALBOOT -eq 1 ]] || [[ $DUALBOOT -eq 2 && "${DUALBOOT_BOOT}" == "yes" ]]; then
+    while true; do
+        ask "Taille partition /boot" "1G"
+        SIZE_BOOT="$REPLY"
+        validate_size "$SIZE_BOOT" && break
+    done
+else
+    SIZE_BOOT=""
+    echo -e "  ${GRN}  → /boot : pas de partition dédiée (intégré à /)${RST}"
+fi
 
-while true; do
-    ask "Taille partition swap" "4G"
-    SIZE_SWAP="$REPLY"
-    validate_size "$SIZE_SWAP" && break
-done
+if [[ $DUALBOOT -eq 1 ]] || [[ $DUALBOOT -eq 2 && "${DUALBOOT_SWAP_PREALLOC}" == "no" ]]; then
+    while true; do
+        ask "Taille partition swap" "4G"
+        SIZE_SWAP="$REPLY"
+        validate_size "$SIZE_SWAP" && break
+    done
+else
+    SIZE_SWAP=""
+    echo -e "  ${GRN}  → swap : partition existante réutilisée (${DUALBOOT_SWAP_PART})${RST}"
+fi
 
-while true; do
-    ask "Taille partition / (root)" "30G"
-    SIZE_ROOT="$REPLY"
-    validate_size "$SIZE_ROOT" && break
-done
+if [[ $DUALBOOT -eq 1 ]] || [[ $DUALBOOT -eq 2 && "${DUALBOOT_ROOT_PREALLOC}" == "no" ]]; then
+    while true; do
+        ask "Taille partition / (root)" "30G"
+        SIZE_ROOT="$REPLY"
+        validate_size "$SIZE_ROOT" && break
+    done
+else
+    SIZE_ROOT=""
+    echo -e "  ${GRN}  → / : partition existante réutilisée (${DUALBOOT_ROOT_PART})${RST}"
+fi
 
 echo -e "  ${GRN}  → /home prendra automatiquement le reste du disque${RST}"
 
@@ -390,7 +604,11 @@ case $CHOICE in
 2) GRUB_TERMINAL="gfxterm" ;;
 esac
 
-yes_no "Désactiver la détection dual-boot (os-prober) ?" "o" || true
+if [[ $DUALBOOT -eq 2 ]]; then
+    yes_no "Désactiver la détection dual-boot (os-prober) ?" "n" || true
+else
+    yes_no "Désactiver la détection dual-boot (os-prober) ?" "o" || true
+fi
 [[ "$REPLY" == "yes" ]] && GRUB_DISABLE_OS_PROBER="true" || GRUB_DISABLE_OS_PROBER="false"
 
 # =============================================================
@@ -479,6 +697,8 @@ echo "║                     RÉCAPITULATIF                       ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${RST}"
 echo -e "  Profil          : ${BLD}$([[ $PROFILE -eq 1 ]] && echo "Desktop" || echo "Serveur")${RST}"
+echo -e "  Firmware        : ${BLD}${FIRMWARE_MODE^^}${RST}$([[ "$FIRMWARE_MODE" == "legacy" ]] && echo "  Table: ${BLD}${LEGACY_PTABLE^^}${RST}" || echo "")"
+echo -e "  Mode install    : ${BLD}$([[ $DUALBOOT -eq 1 ]] && echo "Seul (disque entier)" || echo "Dual-boot")${RST}"
 echo -e "  Hostname        : ${BLD}$HOSTNAME${RST}"
 echo -e "  Utilisateur     : ${BLD}$USERNAME${RST}"
 echo -e "  Locale          : ${BLD}$LOCALE${RST}  Clavier: ${BLD}$KEYBOARD${KEYBOARD_VARIANT:+/$KEYBOARD_VARIANT}${RST}"
@@ -507,7 +727,6 @@ HASH_ROOT=$(hash_password "$PASSWORD_ROOT")
 # CONSTRUCTION DU YAML
 # =============================================================
 
-# Paquets selon profil
 if [[ $PROFILE -eq 1 ]]; then
     PROFILE_PKG="
     - ubuntu-desktop"
@@ -548,6 +767,10 @@ if [[ $PROFILE -eq 1 ]]; then
 fi
 
 ALL_PACKAGES="${PROFILE_PKG}${BASE_PACKAGES}${EXTRA_PKG_LIST}"
+if [[ $DUALBOOT -eq 2 ]]; then
+    ALL_PACKAGES="${ALL_PACKAGES}
+    - os-prober"
+fi
 
 if [[ $PROFILE -eq 1 ]]; then
     if [[ "$KEEP_SNAP_FIREFOX" == "yes" ]]; then
@@ -567,7 +790,6 @@ fi
 
 OUTPUT="$(dirname "$0")/autoinstall.yaml"
 
-# Avertir si fichier existant
 if [[ -f "$OUTPUT" ]]; then
     yes_no "⚠  $OUTPUT existe déjà. Écraser ?" "n" || {
         echo -e "${RED}Annulé.${RST}"
@@ -575,7 +797,276 @@ if [[ -f "$OUTPUT" ]]; then
     }
 fi
 
+build_storage_dualboot() {
+local efi_num
+
+if [[ "$FIRMWARE_MODE" == "legacy" && "$LEGACY_PTABLE" == "mbr" ]]; then
+cat <<STORAGE
+  storage:
+    version: 1
+    config:
+      - type: disk
+        id: disk0
+        path: ${DISK}
+        ptable: msdos
+        preserve: true
+        grub_device: true
+STORAGE
+elif [[ "$FIRMWARE_MODE" == "legacy" && "$LEGACY_PTABLE" == "gpt" ]]; then
+cat <<STORAGE
+  storage:
+    version: 1
+    config:
+      - type: disk
+        id: disk0
+        path: ${DISK}
+        ptable: gpt
+        preserve: true
+        grub_device: false
+
+      - type: partition
+        id: part-bios
+        device: disk0
+        size: 1M
+        flag: bios_grub
+        grub_device: true
+STORAGE
+else
+efi_num=$(lsblk -no KNAME "$EFI_EXISTING" | sed 's/[^0-9]//g')
+cat <<STORAGE
+  storage:
+    version: 1
+    config:
+      - type: disk
+        id: disk0
+        path: ${DISK}
+        ptable: gpt
+        preserve: true
+        grub_device: false
+
+      - type: partition
+        id: part-efi
+        device: disk0
+        number: ${efi_num}
+        preserve: true
+        grub_device: true
+STORAGE
+fi
+
+if [[ "${DUALBOOT_BOOT}" == "yes" ]]; then
+if [[ "$FIRMWARE_MODE" == "legacy" && "$LEGACY_PTABLE" == "mbr" ]]; then
+cat <<STORAGE
+      - type: partition
+        id: part-boot
+        device: disk0
+        size: ${SIZE_BOOT}
+        flag: boot
+        wipe: superblock
+STORAGE
+else
+cat <<STORAGE
+      - type: partition
+        id: part-boot
+        device: disk0
+        size: ${SIZE_BOOT}
+        wipe: superblock
+STORAGE
+fi
+
+cat <<STORAGE
+
+      - type: format
+        id: fmt-boot
+        volume: part-boot
+        fstype: ${FS_BOOT}
+        label: boot
+
+      - type: mount
+        id: mnt-boot
+        device: fmt-boot
+        path: /boot
+STORAGE
+fi
+
+if [[ "${DUALBOOT_SWAP_PREALLOC}" == "yes" ]]; then
+local swap_num
+swap_num=$(lsblk -no KNAME "$DUALBOOT_SWAP_PART" | sed 's/[^0-9]//g')
+cat <<STORAGE
+      - type: partition
+        id: part-swap
+        device: disk0
+        number: ${swap_num}
+        preserve: false
+        wipe: superblock
+STORAGE
+else
+cat <<STORAGE
+      - type: partition
+        id: part-swap
+        device: disk0
+        size: ${SIZE_SWAP}
+        wipe: superblock
+STORAGE
+fi
+
+if [[ "${DUALBOOT_ROOT_PREALLOC}" == "yes" ]]; then
+local root_num
+root_num=$(lsblk -no KNAME "$DUALBOOT_ROOT_PART" | sed 's/[^0-9]//g')
+cat <<STORAGE
+      - type: partition
+        id: part-root
+        device: disk0
+        number: ${root_num}
+        preserve: false
+        wipe: superblock
+STORAGE
+else
+cat <<STORAGE
+      - type: partition
+        id: part-root
+        device: disk0
+        size: ${SIZE_ROOT}
+        wipe: superblock
+STORAGE
+fi
+
+if [[ "${DUALBOOT_HOME_PREALLOC}" == "yes" ]]; then
+local home_num
+home_num=$(lsblk -no KNAME "$DUALBOOT_HOME_PART" | sed 's/[^0-9]//g')
+cat <<STORAGE
+      - type: partition
+        id: part-home
+        device: disk0
+        number: ${home_num}
+        preserve: false
+        wipe: superblock
+STORAGE
+else
+cat <<STORAGE
+      - type: partition
+        id: part-home
+        device: disk0
+        size: -1
+        wipe: superblock
+STORAGE
+fi
+
+cat <<STORAGE
+      - type: format
+        id: fmt-swap
+        volume: part-swap
+        fstype: swap
+        label: swap
+
+      - type: format
+        id: fmt-root
+        volume: part-root
+        fstype: ${FS_ROOT}
+        label: root
+
+      - type: format
+        id: fmt-home
+        volume: part-home
+        fstype: ${FS_HOME}
+        label: home
+STORAGE
+
+if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+cat <<STORAGE
+
+      - type: format
+        id: fmt-efi
+        volume: part-efi
+        fstype: ${FS_EFI}
+        label: EFI
+        preserve: true
+
+      - type: mount
+        id: mnt-efi
+        device: fmt-efi
+        path: /boot/efi
+STORAGE
+fi
+
+cat <<STORAGE
+
+      - type: mount
+        id: mnt-swap
+        device: fmt-swap
+        path: none
+
+      - type: mount
+        id: mnt-root
+        device: fmt-root
+        path: /
+
+      - type: mount
+        id: mnt-home
+        device: fmt-home
+        path: /home
+STORAGE
+}
+
 build_storage_lvm() {
+if [[ "$FIRMWARE_MODE" == "legacy" && "$LEGACY_PTABLE" == "mbr" ]]; then
+cat <<STORAGE
+  storage:
+    version: 1
+    config:
+      - type: disk
+        id: disk0
+        path: ${DISK}
+        ptable: msdos
+        wipe: superblock
+        grub_device: true
+
+      - type: partition
+        id: part-boot
+        device: disk0
+        size: ${SIZE_BOOT}
+        flag: boot
+        wipe: superblock
+
+      - type: partition
+        id: part-lvm
+        device: disk0
+        size: -1
+        flag: linux-lvm
+        wipe: superblock
+STORAGE
+elif [[ "$FIRMWARE_MODE" == "legacy" && "$LEGACY_PTABLE" == "gpt" ]]; then
+cat <<STORAGE
+  storage:
+    version: 1
+    config:
+      - type: disk
+        id: disk0
+        path: ${DISK}
+        ptable: gpt
+        wipe: superblock
+        grub_device: false
+
+      - type: partition
+        id: part-bios
+        device: disk0
+        size: 1M
+        flag: bios_grub
+        grub_device: true
+
+      - type: partition
+        id: part-boot
+        device: disk0
+        size: ${SIZE_BOOT}
+        wipe: superblock
+
+      - type: partition
+        id: part-lvm
+        device: disk0
+        size: -1
+        flag: linux-lvm
+        wipe: superblock
+STORAGE
+else
 cat <<STORAGE
   storage:
     version: 1
@@ -606,6 +1097,10 @@ cat <<STORAGE
         size: -1
         flag: linux-lvm
         wipe: superblock
+STORAGE
+fi
+
+cat <<STORAGE
 
       - type: lvm_volgroup
         id: vg0
@@ -630,12 +1125,20 @@ cat <<STORAGE
         volgroup: vg0
         name: ${LVM_LV_HOME}
         size: -1
+STORAGE
+
+if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+cat <<STORAGE
 
       - type: format
         id: fmt-efi
         volume: part-efi
         fstype: ${FS_EFI}
         label: EFI
+STORAGE
+fi
+
+cat <<STORAGE
 
       - type: format
         id: fmt-boot
@@ -660,11 +1163,19 @@ cat <<STORAGE
         volume: lv-home-id
         fstype: ${FS_HOME}
         label: home
+STORAGE
+
+if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+cat <<STORAGE
 
       - type: mount
         id: mnt-efi
         device: fmt-efi
         path: /boot/efi
+STORAGE
+fi
+
+cat <<STORAGE
 
       - type: mount
         id: mnt-boot
@@ -689,6 +1200,87 @@ STORAGE
 }
 
 build_storage_direct() {
+if [[ "$FIRMWARE_MODE" == "legacy" && "$LEGACY_PTABLE" == "mbr" ]]; then
+cat <<STORAGE
+  storage:
+    version: 1
+    config:
+      - type: disk
+        id: disk0
+        path: ${DISK}
+        ptable: msdos
+        wipe: superblock
+        grub_device: true
+
+      - type: partition
+        id: part-boot
+        device: disk0
+        size: ${SIZE_BOOT}
+        flag: boot
+        wipe: superblock
+
+      - type: partition
+        id: part-swap
+        device: disk0
+        size: ${SIZE_SWAP}
+        wipe: superblock
+
+      - type: partition
+        id: part-root
+        device: disk0
+        size: ${SIZE_ROOT}
+        wipe: superblock
+
+      - type: partition
+        id: part-home
+        device: disk0
+        size: -1
+        wipe: superblock
+STORAGE
+elif [[ "$FIRMWARE_MODE" == "legacy" && "$LEGACY_PTABLE" == "gpt" ]]; then
+cat <<STORAGE
+  storage:
+    version: 1
+    config:
+      - type: disk
+        id: disk0
+        path: ${DISK}
+        ptable: gpt
+        wipe: superblock
+        grub_device: false
+
+      - type: partition
+        id: part-bios
+        device: disk0
+        size: 1M
+        flag: bios_grub
+        grub_device: true
+
+      - type: partition
+        id: part-boot
+        device: disk0
+        size: ${SIZE_BOOT}
+        wipe: superblock
+
+      - type: partition
+        id: part-swap
+        device: disk0
+        size: ${SIZE_SWAP}
+        wipe: superblock
+
+      - type: partition
+        id: part-root
+        device: disk0
+        size: ${SIZE_ROOT}
+        wipe: superblock
+
+      - type: partition
+        id: part-home
+        device: disk0
+        size: -1
+        wipe: superblock
+STORAGE
+else
 cat <<STORAGE
   storage:
     version: 1
@@ -730,12 +1322,21 @@ cat <<STORAGE
         device: disk0
         size: -1
         wipe: superblock
+STORAGE
+fi
+
+if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+cat <<STORAGE
 
       - type: format
         id: fmt-efi
         volume: part-efi
         fstype: ${FS_EFI}
         label: EFI
+STORAGE
+fi
+
+cat <<STORAGE
 
       - type: format
         id: fmt-boot
@@ -760,11 +1361,19 @@ cat <<STORAGE
         volume: part-home
         fstype: ${FS_HOME}
         label: home
+STORAGE
+
+if [[ "$FIRMWARE_MODE" == "uefi" ]]; then
+cat <<STORAGE
 
       - type: mount
         id: mnt-efi
         device: fmt-efi
         path: /boot/efi
+STORAGE
+fi
+
+cat <<STORAGE
 
       - type: mount
         id: mnt-boot
@@ -788,8 +1397,6 @@ cat <<STORAGE
 STORAGE
 }
 
-# Écriture du fichier YAML — les hashes sont injectés directement
-# sans passer par sed, évitant tout problème avec les caractères spéciaux
 {
 cat <<HEADER
 #cloud-config
@@ -812,7 +1419,6 @@ autoinstall:
 
 HEADER
 
-# Snaps uniquement en mode Desktop
 if [[ $PROFILE -eq 1 ]]; then
 cat <<SNAPS
   snaps:${ALL_SNAPS}
@@ -845,13 +1451,14 @@ cat <<IDENTITY
 
 IDENTITY
 
-if [[ $STORAGE_TYPE -eq 1 ]]; then
+if [[ $DUALBOOT -eq 2 ]]; then
+    build_storage_dualboot
+elif [[ $STORAGE_TYPE -eq 1 ]]; then
     build_storage_lvm
 else
     build_storage_direct
 fi
 
-# user-data : format cloud-init moderne (chpasswd v2)
 cat <<USERDATA
 
   user-data:
@@ -870,8 +1477,6 @@ cat <<USERDATA
 
 USERDATA
 
-# late-commands : construction propre sans sed sur variables utilisateur
-# Les valeurs GRUB sont écrites via printf pour éviter les injections
 cat <<'LATECOMMANDS_OPEN'
   late-commands:
       - curtin in-target -- add-apt-repository universe -y
@@ -879,7 +1484,6 @@ cat <<'LATECOMMANDS_OPEN'
       - curtin in-target -- add-apt-repository restricted -y
 LATECOMMANDS_OPEN
 
-# GRUB_CMDLINE via printf (évite les problèmes de / = dans sed)
 printf "      - >-\n"
 printf "        sh -c 'printf %%s\\\\n \"%s\" > /target/etc/default/grub.d/99-autoinstall.cfg'\n" \
     "GRUB_CMDLINE_LINUX_DEFAULT=\"${GRUB_CMDLINE}\""
@@ -916,8 +1520,7 @@ cat <<LATECOMMANDS_GRUB
       - curtin in-target -- apt-get autoremove -y
 LATECOMMANDS_GRUB
 
-# Firefox via Mozilla APT
-if [[ $PROFILE -eq 1 ]]; then
+if [[ $PROFILE -eq 1 && "$KEEP_SNAP_FIREFOX" == "no" ]]; then
 cat <<'FIREFOX_CMDS'
       - install -d -m 0755 /target/etc/apt/keyrings
       - >-
@@ -926,16 +1529,17 @@ cat <<'FIREFOX_CMDS'
       - >-
         sh -c 'gpg -n -q --import --import-options import-show
         /target/etc/apt/keyrings/packages.mozilla.org.asc 2>&1
-        | grep -q 35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3
-        && echo "Mozilla GPG fingerprint OK"
-        || echo "WARNING: Mozilla GPG fingerprint mismatch"'
+        | awk "/pub/{getline; gsub(/^ +| +\$/,\"\");
+        if(\$0==\"35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3\")
+        print \"Mozilla GPG fingerprint OK\";
+        else print \"WARNING: mismatch: \"\$0}"'
       - >-
         printf 'Types: deb\nURIs: https://packages.mozilla.org/apt\nSuites: mozilla\nComponents: main\nSigned-By: /etc/apt/keyrings/packages.mozilla.org.asc\n'
         > /target/etc/apt/sources.list.d/mozilla.sources
       - >-
         printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n'
         > /target/etc/apt/preferences.d/mozilla
-      - curtin in-target -- apt-get update
+      - curtin in-target -- apt-get update || true
       - curtin in-target -- apt-get install -y firefox
 FIREFOX_CMDS
 fi
