@@ -11,6 +11,8 @@
 
 Génère un fichier `autoinstall.yaml` (cloud-init/subiquity) pour une installation sans surveillance d'Ubuntu 26.04 LTS.
 
+🔗 https://github.com/ps81frt/autoinstall-gen-ubuntu
+
 ---
 
 ## Prérequis
